@@ -1,5 +1,19 @@
 abstract type AbstractMessageType end
 
+# taken from Jtb
+@inline function withtrace(e, msg=nothing)
+    buffer = IOBuffer();
+    if !isnothing(msg)
+        println(buffer, msg)
+    end
+    println(buffer, e)
+    st = stacktrace(catch_backtrace());
+    for (idx, l) in enumerate(st)
+        println(buffer, " [$idx] $l")
+    end
+    return(String(take!(buffer)))
+end
+
 struct NotificationType{TPARAM} <: AbstractMessageType
     method::String
 end
@@ -62,9 +76,21 @@ function dispatch_msg(x::JSONRPCEndpoint, dispatcher::MsgDispatcher, msg)
         handler = get(dispatcher._handlers, method_name, nothing)
         if handler !== nothing
             param_type = get_param_type(handler.message_type)
-            params = param_type === Nothing ? nothing : param_type <: NamedTuple ? convert(param_type,(;(Symbol(i[1])=>i[2] for i in msg["params"])...)) : param_type(msg["params"])
+            params = nothing
+            res = nothing
+            try
+                params = param_type === Nothing ? nothing : param_type <: NamedTuple ? convert(param_type,(;(Symbol(i[1])=>i[2] for i in msg["params"])...)) : param_type(msg["params"])
+            catch err                
+                send_error_response(x, msg, -32602, withtrace(err, "parameter conversion failed"), nothing)                
+                return
+            end
 
-            res = handler.func(x, params)
+            try
+                res = handler.func(x, params)
+            catch err                
+                send_error_response(x, msg, -32000, withtrace(err, "function failed"), nothing)                
+                return
+            end                
 
             if handler.message_type isa RequestType
                 if res isa JSONRPCError
@@ -74,11 +100,10 @@ function dispatch_msg(x::JSONRPCEndpoint, dispatcher::MsgDispatcher, msg)
                 else
                     error_msg = "The handler for the '$method_name' request returned a value of type $(typeof(res)), which is not a valid return type according to the request definition."
                     send_error_response(x, msg, -32603, error_msg, nothing)                    
-                    error(error_msg)
                 end
             end
         else
-            error("Unknown method $method_name.")
+            send_error_response(x, msg, -32601, "Unknown method '$method_name'.", nothing)
         end
     finally
         dispatcher._currentlyHandlingMsg = false
